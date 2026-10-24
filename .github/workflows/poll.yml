@@ -1,0 +1,44 @@
+name: Poll DroidDeck branches
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_REPO: ${{ vars.DROIDDECK_REPO || 'K11MCH1/DroidDeck' }}
+      BRANCHES: ${{ vars.DROIDDECK_BRANCHES || 'main qualcomm-driver' }}
+    steps:
+      - name: Start a build for each new branch head
+        run: |
+          set -euo pipefail
+          runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow build.yml --limit 200 --json displayTitle --jq '.[].displayTitle')
+          for branch in $BRANCHES; do
+            sha=$(git ls-remote "https://github.com/$SOURCE_REPO.git" "refs/heads/$branch" | cut -f1)
+            if [ -z "$sha" ]; then
+              echo "::warning::$SOURCE_REPO has no branch $branch"
+              continue
+            fi
+            label=$(tr -c 'A-Za-z0-9._\n-' '-' <<<"$branch")
+            if gh release view "$label-${sha::7}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$branch $sha: already published"
+            elif grep -qF "$sha" <<<"$runs"; then
+              echo "$branch $sha: a build already ran or is running; start another one by hand to retry"
+            else
+              gh workflow run build.yml -R "$GITHUB_REPOSITORY" -f ref="$sha" -f label="$branch"
+              echo "$branch $sha: build started" | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          done

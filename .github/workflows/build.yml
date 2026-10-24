@@ -1,0 +1,657 @@
+name: Build DroidDeck APK
+run-name: DroidDeck ${{ inputs.label }} ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: DroidDeck branch, tag or full commit SHA
+        required: true
+        default: qualcomm-driver
+      label:
+        description: Name for the build (defaults to the branch; poll.yml passes the branch it found)
+        required: false
+        default: ''
+      qualcomm_pins:
+        description: If the CI-built Qualcomm components differ from runtime.json, re-pin them (rebuild) or fail (strict)
+        type: choice
+        options: [rebuild, strict]
+        default: rebuild
+      app_id_suffix:
+        description: Debug applicationId suffix (.xr matches the local dev builds; empty for com.droiddeck.launcher)
+        required: false
+        default: .xr
+      publish:
+        description: Publish a prerelease named after the source commit
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: ${{ vars.DROIDDECK_REPO || 'K11MCH1/DroidDeck' }}
+  # DroidDeck's own CI builds in this directory; building at the same path keeps the add-on packs
+  # byte-identical to the ones the app downloads from Droid-Deck/DroidDeck-Components.
+  SRC: /home/runner/work/DroidDeck/DroidDeck
+  PRELOAD_CACHE_VERSION: ci-v1
+  QUALCOMM_CACHE_VERSION: ci-v1
+
+jobs:
+  resolve:
+    name: Resolve the source commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      label: ${{ steps.resolve.outputs.label }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      qualcomm: ${{ steps.resolve.outputs.qualcomm }}
+      qualcomm-key: ${{ steps.resolve.outputs.qualcomm-key }}
+    steps:
+      - name: Resolve
+        id: resolve
+        env:
+          REF: ${{ inputs.ref }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          git init -q src && cd src
+          git remote add origin "https://github.com/$SOURCE_REPO.git"
+          git config remote.origin.promisor true
+          git config remote.origin.partialclonefilter blob:none
+          git fetch -q --depth 1 --filter=blob:none origin "$REF"
+          sha=$(git rev-parse FETCH_HEAD)
+          if [ -z "$LABEL" ]; then
+            if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then LABEL=commit; else LABEL=${REF#refs/heads/}; fi
+          fi
+          label=$(tr -c 'A-Za-z0-9._\n-' '-' <<<"$LABEL")
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha::7}" >> "$GITHUB_OUTPUT"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+          echo "tag=$label-${sha::7}" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git ls-tree "$sha" tools/qualcomm/runtime.json)" ]; then
+            recipe=$(git ls-tree -r "$sha" tools/qualcomm tools/gamescope/patches | grep -vE '	tools/qualcomm/(runtime\.json|README\.md|probe\.py|[^/]*\.c)$' || true)
+            wsi=$(git show "$sha:tools/qualcomm/runtime.json" | jq -r '.wsi.sha256 // ""')
+            key=$(printf '%s\n%s\n' "$recipe" "$wsi" | sha256sum | cut -c1-32)
+            echo "qualcomm=true" >> "$GITHUB_OUTPUT"
+            echo "qualcomm-key=$key" >> "$GITHUB_OUTPUT"
+          else
+            echo "qualcomm=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Building \`$SOURCE_REPO@$sha\` as \`$label-${sha::7}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  xbox:
+    name: Xbox ARM64 backend
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: ${{ env.SRC }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: droiddeck
+          persist-credentials: false
+      - name: Move the source to DroidDeck's CI path
+        working-directory: ${{ github.workspace }}
+        run: mkdir -p "$(dirname "$SRC")" && mv droiddeck "$SRC"
+      - name: Cache key
+        id: key
+        run: echo "xbox=$(git rev-parse HEAD:tools/xbox)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: xbox-cache
+        with:
+          path: |
+            ${{ env.SRC }}/app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
+            ${{ env.SRC }}/app/build/xbox/xodus-droiddeck-source.tar.xz
+            ${{ env.SRC }}/app/build/xbox/runtime/*-source.tar.xz
+          key: xbox-arm64-${{ steps.key.outputs.xbox }}
+      - name: Build Xbox backend
+        if: steps.xbox-cache.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential pkg-config libssl-dev protobuf-compiler cmake xz-utils
+          bash tools/xbox/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xbox-arm64
+          path: ${{ env.SRC }}/app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
+          retention-days: 7
+
+  qualcomm:
+    name: Qualcomm Gamescope, Zink and WSI (Arch Linux ARM)
+    needs: resolve
+    if: needs.resolve.outputs.qualcomm == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: droiddeck
+          persist-credentials: false
+      - uses: actions/cache@v4
+        id: qualcomm-cache
+        with:
+          path: droiddeck/qualcomm-out
+          key: qualcomm-${{ env.QUALCOMM_CACHE_VERSION }}-${{ needs.resolve.outputs.qualcomm-key }}-${{ hashFiles('ci/ci/qualcomm/**') }}
+      - name: Build in Arch Linux ARM
+        if: steps.qualcomm-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/droiddeck:/work" -v "$PWD/ci/ci:/ci:ro" -w /work \
+            menci/archlinuxarm:base-devel bash /ci/qualcomm/build-in-arch.sh
+          sudo chown -R "$(id -u):$(id -g)" droiddeck
+      - name: Report
+        run: |
+          {
+            echo "### Qualcomm components"
+            echo
+            [ "${{ steps.qualcomm-cache.outputs.cache-hit }}" = true ] && echo "Restored from the cache of an earlier CI build of the same recipes." && echo
+            echo '```'
+            cat droiddeck/qualcomm-out/qualcomm-toolchain.txt
+            echo '```'
+            cat droiddeck/qualcomm-out/needed.md
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualcomm-components
+          path: droiddeck/qualcomm-out
+          retention-days: 7
+
+  apk:
+    name: Build the debug APK
+    needs: [resolve, xbox, qualcomm]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.xbox.result == 'success' && (needs.qualcomm.result == 'success' || needs.qualcomm.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      pins: ${{ steps.pins.outputs.status }}
+    defaults:
+      run:
+        working-directory: ${{ env.SRC }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: droiddeck
+          persist-credentials: false
+      - name: Move the source to DroidDeck's CI path
+        working-directory: ${{ github.workspace }}
+        run: mkdir -p "$(dirname "$SRC")" && mv droiddeck "$SRC"
+
+      - name: Cache keys
+        id: keys
+        run: |
+          set -euo pipefail
+          tree() { for p in "$@"; do git rev-parse "HEAD:$p" 2>/dev/null || echo "absent:$p"; done | sha256sum | cut -c1-40; }
+          echo "preloads=$(tree app/src/main/cpp/fakeinput_steam.cpp app/src/main/cpp/adrenotools/src/hook/kgsl.h \
+            tools/quest tools/linuxfs tools/proot/fastpath tools/gamescope/release.env tools/wlroots/release.env \
+            tools/mangoapp tools/msitools tools/pipewire tools/comet tools/xbox tools/vr)" >> "$GITHUB_OUTPUT"
+          echo "proot=$(tree tools/proot)" >> "$GITHUB_OUTPUT"
+          echo "cxx=$(tree app/src/main/cpp tools/vr/src)" >> "$GITHUB_OUTPUT"
+          echo "stores=$(tree app/src/main/rust/stores/Cargo.lock)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-cleanup: on-success
+
+      - name: Resolve the runner's NDK
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          VERSION=$(sed -n 's/^Pkg.Revision *= *//p' "$NDK/source.properties")
+          echo "NDK_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache the preloads
+        id: preloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC }}/app/src/main/assets/linuxfs
+          key: preloads-${{ env.PRELOAD_CACHE_VERSION }}-${{ steps.keys.outputs.preloads }}
+
+      - name: Build libfakeinput.so and libblsession.so (glibc aarch64)
+        if: steps.preloads.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources \
+            -o Dir::Etc::sourceparts=- -o Acquire::Retries=3 update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libvulkan1 mesa-vulkan-drivers >/dev/null
+          D=app/src/main/assets/linuxfs
+          mkdir -p "$D"
+          aarch64-linux-gnu-g++ -shared -fPIC -O2 -Wall -Wno-attributes -Wno-nonnull-compare \
+            -pthread -std=c++17 -static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL \
+            -o "$D/libfakeinput.so" app/src/main/cpp/fakeinput_steam.cpp -ldl
+          aarch64-linux-gnu-strip --strip-unneeded "$D/libfakeinput.so"
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -pthread \
+            -o "$D/libblsession.so" tools/linuxfs/preload/*.c -ldl
+          aarch64-linux-gnu-strip --strip-unneeded "$D/libblsession.so"
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -pthread \
+            -o "$D/libblfastpath.so" tools/proot/fastpath/fastpath.c -ldl
+          aarch64-linux-gnu-strip --strip-unneeded "$D/libblfastpath.so"
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -nostdlib -ffreestanding -fno-stack-protector \
+            -fno-tree-loop-distribute-patterns -Wl,-z,defs -o "$D/libblaudit.so" tools/proot/fastpath/audit.c
+          aarch64-linux-gnu-strip --strip-unneeded "$D/libblaudit.so"
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -pthread \
+            -o "$D/libssbs.so" tools/linuxfs/ssbs/ssbs_adapter.c -ldl
+          aarch64-linux-gnu-strip --strip-unneeded "$D/libssbs.so"
+          mkdir -p "$D/usr/local/bin"
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -o "$D/usr/local/bin/droiddeck-clipboard" tools/linuxfs/clipboard/clipboard.c -ldl
+          aarch64-linux-gnu-strip --strip-unneeded "$D/usr/local/bin/droiddeck-clipboard"
+          VK_INCLUDE=$(ls -d "${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"/toolchains/llvm/prebuilt/*/sysroot/usr/include | head -1) \
+            tools/vr/build.sh --native "$D/usr/local/lib/droiddeck-vr"
+          for script in tools/linuxfs/overlay/usr/local/bin/droiddeck-* tools/linuxfs/overlay/usr/local/bin/steam-compatibility; do
+            install -Dm644 "$script" "$D/usr/local/bin/$(basename "$script")"
+          done
+          for f in tools/linuxfs/overlay/usr/bin/* tools/linuxfs/overlay/usr/bin/steamos-polkit-helpers/*; do
+            [ -f "$f" ] && install -Dm644 "$f" "$D/${f#tools/linuxfs/overlay/}"
+          done
+          if [ -f tools/gamescope/release.env ]; then
+            . tools/gamescope/release.env
+            curl -fsSL --retry 3 -o gamescope.tzst "https://github.com/${GAMESCOPE_REPO:-$SOURCE_REPO}/releases/download/${GAMESCOPE_TAG}/gamescope.tzst"
+            echo "${GAMESCOPE_SHA256}  gamescope.tzst" | sha256sum -c -
+            tar --use-compress-program=unzstd -xf gamescope.tzst -C "$D"
+            test -f "$D/usr/local/bin/gamescope"
+            rm gamescope.tzst
+          fi
+          . tools/linuxfs/uruntime.env
+          curl -fsSL --retry 3 -o uruntime "https://github.com/VHSgunzo/uruntime/releases/download/${URUNTIME_VERSION}/${URUNTIME_ASSET}"
+          echo "${URUNTIME_SHA256}  uruntime" | sha256sum -c -
+          install -Dm644 uruntime "$D/usr/local/lib/droiddeck/uruntime"
+          install -Dm644 tools/linuxfs/licenses/uruntime-LICENSE "$D/usr/local/share/licenses/uruntime/LICENSE"
+          rm uruntime
+          M="$D/usr/local/lib/mangoapp"
+          mkdir -p "$M" mango-pkgs
+          grep -v '^#' tools/mangoapp/packages.txt | while read -r sum url; do
+            [ -n "$url" ] || continue
+            curl -fsSL --retry 3 -o mango-pkgs/pkg.tar.zst "$url"
+            echo "$sum  mango-pkgs/pkg.tar.zst" | sha256sum -c -
+            tar --use-compress-program=unzstd -xf mango-pkgs/pkg.tar.zst -C mango-pkgs
+            rm mango-pkgs/pkg.tar.zst
+          done
+          install -m644 mango-pkgs/usr/bin/mangoapp "$M/mangoapp"
+          for so in libfmt.so.10 libspdlog.so.1.13 libglfw.so.3 libtraceevent.so.1; do
+            cp -L "mango-pkgs/usr/lib/$so" "$M/$so"
+          done
+          aarch64-linux-gnu-gcc -shared -fPIC -O2 -Wall -Wl,-soname,libtracefs.so.1 \
+            -o "$M/libtracefs.so.1" tools/mangoapp/libtracefs-shim.c
+          aarch64-linux-gnu-strip --strip-unneeded "$M/libtracefs.so.1"
+          install -Dm644 tools/mangoapp/mangoapp "$D/usr/local/bin/mangoapp"
+          rm -rf mango-pkgs
+          if [ -f tools/pipewire/packages.txt ]; then
+            mkdir -p pw-pkgs
+            grep -v '^#' tools/pipewire/packages.txt | while read -r sum url; do
+              [ -n "$url" ] || continue
+              curl -fsSL --retry 3 -o pw-pkgs/pkg.tar.zst "$url"
+              echo "$sum  pw-pkgs/pkg.tar.zst" | sha256sum -c -
+              tar --use-compress-program=unzstd -xf pw-pkgs/pkg.tar.zst -C pw-pkgs
+              rm pw-pkgs/pkg.tar.zst
+            done
+            tools/pipewire/assemble.sh pw-pkgs "$D/usr/local/lib/droiddeck-pipewire.tzst"
+            rm -rf pw-pkgs
+          fi
+          T="$D/usr/local/lib/droiddeck-msitools"
+          mkdir -p "$T" msi-pkgs
+          grep -v '^#' tools/msitools/packages.txt | while read -r sum url; do
+            [ -n "$url" ] || continue
+            curl -fsSL --retry 3 -o msi-pkgs/pkg.tar.xz "$url"
+            echo "$sum  msi-pkgs/pkg.tar.xz" | sha256sum -c -
+            tar -xJf msi-pkgs/pkg.tar.xz -C msi-pkgs
+            rm msi-pkgs/pkg.tar.xz
+          done
+          install -m644 msi-pkgs/usr/bin/msiinfo "$T/msiinfo"
+          install -m644 msi-pkgs/usr/bin/cabextract "$T/cabextract"
+          install -m644 msi-pkgs/usr/lib/7zip/7z "$T/7z"
+          install -m644 msi-pkgs/usr/lib/7zip/7z.so "$T/7z.so"
+          for so in libmsi-1.0.so.0 libgsf-1.so.114 libgcab-1.0.so.0; do
+            cp -L "msi-pkgs/usr/lib/$so" "$T/$so"
+          done
+          for f in NOTICE GPL-2 GPL-3 LGPL-2.1 7zip-License 7zip-unRarLicense; do
+            install -Dm644 "tools/msitools/licenses/$f" "$D/usr/local/share/licenses/droiddeck-msitools/$f"
+          done
+          rm -rf msi-pkgs
+          install -Dm644 tools/linuxfs/desktop/droiddeck-desktop "$D/usr/local/bin/droiddeck-desktop"
+          install -Dm644 tools/linuxfs/desktop/droiddeck-gpu "$D/usr/local/bin/droiddeck-gpu"
+          install -Dm644 tools/linuxfs/desktop/droiddeck-desktop-gpu "$D/usr/local/bin/droiddeck-desktop-gpu"
+          install -Dm644 tools/linuxfs/desktop/kwin_wayland_wrapper "$D/usr/local/bin/kwin_wayland_wrapper"
+          install -Dm644 tools/linuxfs/desktop/firefox-droiddeck.js "$D/usr/lib/firefox/defaults/pref/droiddeck.js"
+
+      - name: Fetch the Debian image the x86 preloads build in
+        if: steps.preloads.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . tools/linuxfs/debian-image.env
+          image=public.ecr.aws/docker/library/debian:bullseye
+          for repo in "$SOURCE_REPO" Droid-Deck/DroidDeck; do
+            if gh release download "$DEBIAN_IMAGE_TAG" -R "$repo" -p "$DEBIAN_IMAGE_ASSET" -O /tmp/debian-image.tar.zst --clobber 2>/dev/null \
+               && { [ -z "$DEBIAN_IMAGE_SHA256" ] || echo "$DEBIAN_IMAGE_SHA256  /tmp/debian-image.tar.zst" | sha256sum -c -; }; then
+              zstd -dc /tmp/debian-image.tar.zst | docker load
+              rm -f /tmp/debian-image.tar.zst
+              break
+            fi
+          done
+          if ! docker image inspect "$image" >/dev/null 2>&1; then
+            echo "::warning::the pinned Debian image could not be fetched; pulling from the registry instead"
+            for attempt in 1 2 3 4 5; do
+              docker pull "$image" && break
+              [ "$attempt" -lt 5 ] || { echo "::error::could not pull $image after $attempt attempts"; exit 1; }
+              sleep $((attempt * 30))
+            done
+          fi
+
+      - name: Build the x86 preloads FEX guests load (glibc 2.31)
+        if: steps.preloads.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD:/src" -w /src public.ecr.aws/docker/library/debian:bullseye bash -c '
+            set -euo pipefail
+            install_compilers() {
+              apt-get -o Acquire::Check-Valid-Until=false update -qq &&
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc g++ gcc-multilib g++-multilib binutils >/dev/null
+            }
+            printf "deb http://deb.debian.org/debian bullseye main\ndeb http://security.debian.org/debian-security bullseye-security main\n" > /etc/apt/sources.list
+            if ! install_compilers; then
+              printf "deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n" > /etc/apt/sources.list
+              install_compilers
+            fi
+            tools/linuxfs/build-x86-preloads.sh app/src/main/assets/linuxfs
+          '
+          sudo chown -R "$(id -u):$(id -g)" app/src/main/assets/linuxfs
+
+      - name: Bundle the droiddeck-esync packs
+        run: |
+          set -euo pipefail
+          if [ -f tools/droiddeck-esync/release.env ]; then
+            . tools/droiddeck-esync/release.env
+            release_url="https://github.com/${SYNC_BUNDLE_REPO}/releases/download/${SYNC_BUNDLE_TAG}"
+            curl -fsSL --retry 3 -o sync-bundle.tzst "$release_url/$SYNC_BUNDLE_ASSET"
+            echo "$SYNC_BUNDLE_SHA256  sync-bundle.tzst" | sha256sum -c -
+            mkdir -p app/src/main/assets/droiddeck-esync
+            tar --use-compress-program=unzstd -xf sync-bundle.tzst -C app/src/main/assets/droiddeck-esync
+            rm sync-bundle.tzst
+            curl -fsSL --retry 3 -o sync-index.json "$release_url/index.json"
+            revoked=$(python3 -c 'import json, sys; print(" ".join(p["id"] for p in json.load(open(sys.argv[1]))["packs"] if p.get("revoked") is True))' sync-index.json)
+            for id in $revoked; do
+              if [ -e "app/src/main/assets/droiddeck-esync/packs/$id.tzst" ]; then
+                echo "::warning::$SYNC_BUNDLE_ASSET carries revoked pack $id; it is left out of the APK"
+                rm -f "app/src/main/assets/droiddeck-esync/packs/$id.tzst"
+              fi
+            done
+            rm sync-index.json
+            test -f app/src/main/assets/droiddeck-esync/index.json
+            test -f app/src/main/assets/droiddeck-esync/index.json.sig
+          fi
+
+      - name: Cache PulseAudio 13.0 source
+        id: pa-src
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SRC }}/pa13
+          key: pulseaudio-src-13.0
+      - name: Fetch PulseAudio 13.0 source
+        if: steps.pa-src.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o pa.tar.gz https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v13.0.tar.gz
+          mkdir -p pa13 && tar -xzf pa.tar.gz -C pa13 --strip-components=1 && rm pa.tar.gz
+      - name: Fetch DirectAudio (tools/directaudio/release.env)
+        run: tools/directaudio/fetch.sh "$PWD" "$PWD/sink-out"
+      - name: Build the AAudio sink into the audio bundle
+        run: |
+          set -euo pipefail
+          export NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          tools/aaudio-sink/build.sh "$PWD/pa13" "$PWD/sink-out"
+          rm -rf pa-bundle && mkdir -p pa-bundle
+          tar --use-compress-program=unzstd -xf app/src/main/assets/pulseaudio.tzst -C pa-bundle
+          test ! -f pa-bundle/modules/arm64/module-aaudio-sink.so
+          install -m755 sink-out/module-aaudio-sink.so pa-bundle/modules/arm64/module-aaudio-sink.so
+          install -m755 sink-out/module-directaudio-native-sink.so pa-bundle/modules/arm64/module-directaudio-native-sink.so
+          (cd pa-bundle && tar --use-compress-program='zstd -19' -cf ../pulseaudio.tzst .)
+          mkdir -p app/build/prepared-assets
+          mv pulseaudio.tzst app/build/prepared-assets/pulseaudio.tzst
+          rm -rf pa-bundle sink-out
+
+      - name: Cache proot
+        id: proot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.SRC }}/app/src/main/jniLibs/arm64-v8a/libproot.so
+            ${{ env.SRC }}/app/src/main/jniLibs/arm64-v8a/libproot-loader.so
+          key: proot-${{ env.NDK_VERSION }}-${{ steps.keys.outputs.proot }}
+      - name: Build proot
+        if: steps.proot.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          export NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          tools/proot/build.sh app/src/main/jniLibs/arm64-v8a
+
+      - name: Check the preloads
+        run: bash tools/linuxfs/check-preloads.sh app/src/main/assets/linuxfs
+
+      - name: Rust toolchain for the store engines (aarch64-linux-android)
+        id: rust
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android
+          echo "rustc=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache cargo registry and the store engines' target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-ndk
+            ${{ env.SRC }}/app/src/main/rust/stores/target
+          key: stores-${{ steps.rust.outputs.rustc }}-${{ steps.keys.outputs.stores }}
+          restore-keys: |
+            stores-${{ steps.rust.outputs.rustc }}-
+
+      - name: cargo-ndk
+        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
+
+      - name: Cache the CMake build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.SRC }}/app/.cxx
+            ${{ env.SRC }}/app/build/intermediates/cxx
+          key: cxx-debug-${{ env.NDK_VERSION }}-${{ steps.keys.outputs.cxx }}
+          restore-keys: |
+            cxx-debug-${{ env.NDK_VERSION }}-
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: xbox-arm64
+          path: ${{ env.SRC }}/app/src/main/assets/linuxfs/usr/local/lib/droiddeck-xbox
+
+      - name: Build GOG Galaxy companion
+        if: steps.preloads.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install 1.90.0 --profile minimal
+          rustup target add --toolchain 1.90.0 aarch64-unknown-linux-gnu
+          RUSTUP_TOOLCHAIN=1.90.0 bash tools/comet/build.sh
+
+      - name: Build the add-on packs
+        run: bash tools/packs/build.sh app/build/packs
+
+      - name: The add-on packs are published where the app downloads them
+        run: |
+          set -euo pipefail
+          missing=0
+          for pack in app/build/packs/*.tar.zst; do
+            name=$(basename "$pack" .tar.zst)
+            sha=$(sha256sum "$pack" | cut -d' ' -f1)
+            url="https://github.com/Droid-Deck/DroidDeck-Components/releases/download/pack-$name-${sha::16}/$name.tar.zst"
+            if curl -fsIL --retry 3 -o /dev/null "$url"; then
+              echo "- \`$name\` \`${sha::16}\`: published" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$name.tar.zst ($sha) is not published at $url; a fresh install could not download it"
+              echo "- \`$name\` \`${sha::16}\`: **not published**" >> "$GITHUB_STEP_SUMMARY"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/download-artifact@v4
+        if: needs.resolve.outputs.qualcomm == 'true'
+        with:
+          name: qualcomm-components
+          path: ${{ env.SRC }}/build
+
+      - name: Compare the Qualcomm components with runtime.json
+        id: pins
+        if: needs.resolve.outputs.qualcomm == 'true'
+        env:
+          MODE: ${{ inputs.qualcomm_pins }}
+        run: |
+          set -euo pipefail
+          python3 -I "$GITHUB_WORKSPACE/ci/ci/qualcomm_pins.py" --source . --mode "$MODE" --report "$RUNNER_TEMP/qualcomm-pins.md"
+          cat "$RUNNER_TEMP/qualcomm-pins.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure the debug build
+        env:
+          SUFFIX: ${{ inputs.app_id_suffix }}
+          LABEL: ${{ needs.resolve.outputs.label }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          PINS: ${{ steps.pins.outputs.status }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SUFFIX" ]; then echo "droiddeck.debugApplicationIdSuffix=$SUFFIX" > local.properties; fi
+          state=clean
+          [ -z "$(git status --porcelain --untracked-files=no)" ] || state=dirty
+          label="$LABEL at ${SHA::7}"
+          [ "$PINS" != repinned ] || label="$label, Qualcomm re-pinned by CI"
+          {
+            echo "DROIDDECK_BUILD_TREE_STATE=$state"
+            echo "DROIDDECK_BUILD_LABEL=$label"
+            echo "DROIDDECK_SOURCE_COMMIT=$SHA"
+            echo "DROIDDECK_PR_NUMBER=0"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          python3 tools/quest/build-driver.py "$ANDROID_HOME/ndk/$NDK_VERSION"
+          python3 tools/release/runtime_inputs.py record
+          python3 tools/release/runtime_inputs.py verify
+          ./gradlew :app:assembleDebug --console=plain -PndkVersion="$NDK_VERSION"
+
+      - name: Runtime-input verification of the APK
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          python3 tools/release/check_session_assets.py "$APK"
+          python3 tools/release/runtime_inputs.py apk "$APK"
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}}"
+          python3 tools/release/check_android_libraries.py "$APK" \
+            --readelf "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --min-sdk-version 26 --print-certs "$APK" | grep -qi "CN=Android, OU=Android, O=Android" \
+            || { echo "::error::the APK is not signed with the AOSP testkey"; exit 1; }
+
+      - name: Name the APK after the source commit
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SUFFIX: ${{ inputs.app_id_suffix }}
+          PINS: ${{ steps.pins.outputs.status }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          apk="DroidDeck-$TAG-debug.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$out/$apk"
+          [ ! -f "$RUNNER_TEMP/qualcomm-pins.md" ] || cp "$RUNNER_TEMP/qualcomm-pins.md" "$out/qualcomm-pins.md"
+          jq -n --arg repo "$SOURCE_REPO" --arg sha "$SHA" --arg apk "$apk" --arg app_id "com.droiddeck.launcher$SUFFIX" \
+            --arg ndk "$NDK_VERSION" --arg pins "${PINS:-not applicable}" --arg label "$DROIDDECK_BUILD_LABEL" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{source: $repo, commit: $sha, apk: $apk, application_id: $app_id, build_label: $label, ndk: $ndk, qualcomm_pins: $pins, run: $run}' \
+            > "$out/build-info.json"
+          (cd "$out" && sha256sum "$apk" > SHA256SUMS)
+          cat "$out/build-info.json" "$out/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DroidDeck-${{ needs.resolve.outputs.tag }}-debug
+          path: ${{ runner.temp }}/out
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish:
+    name: Publish the release
+    needs: [resolve, apk]
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ needs.resolve.outputs.label }}
+      cancel-in-progress: false
+    env:
+      KEEP: ${{ vars.KEEP_RELEASES || '15' }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: DroidDeck-${{ needs.resolve.outputs.tag }}-debug
+          path: out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          LABEL: ${{ needs.resolve.outputs.label }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          subject=$(gh api "repos/$SOURCE_REPO/commits/$SHA" --jq '.commit.message | split("\n")[0]' || echo "")
+          {
+            echo "Debug APK of [\`$SOURCE_REPO@${SHA::7}\`]($GITHUB_SERVER_URL/$SOURCE_REPO/commit/$SHA) ($LABEL): $subject"
+            echo
+            echo "- Package: \`$(jq -r .application_id out/build-info.json)\`, signed with the public AOSP testkey; installs over a local debug build of the same package."
+            echo "- Built with the prepared Linux runtime and the published add-on packs; the runtime-input verification passed on this APK."
+            echo "- Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            if [ -f out/qualcomm-pins.md ]; then cat out/qualcomm-pins.md; echo; fi
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "$LABEL ${SHA::7}" --notes-file notes.md out/*.apk out/SHA256SUMS out/build-info.json
+          echo "Published $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+          gh release list -R "$GITHUB_REPOSITORY" -L 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("'"$LABEL"'-"))] | sort_by(.createdAt) | reverse | .['"$KEEP"':][] | .tagName' |
+            while IFS= read -r old; do
+              gh release delete "$old" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            done
